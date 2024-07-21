@@ -1,6 +1,6 @@
 import asyncio
-from collections import defaultdict
 import csv
+from collections import defaultdict
 import discord
 from discord.ext import commands
 import aiohttp
@@ -14,28 +14,29 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-car_brands = {}
-car_models = defaultdict(list)
+# Data structures to hold car information
+car_brands = set()
+car_models = defaultdict(lambda: defaultdict(set))
 
-# Creating a database for the bot
-with open('carapi-opendatafeed-sample.csv', 'r') as file:
-    reader = csv.DictReader(file)
-    for row in reader:
-        make = row['Make Name']
-        model = row['Model Name']
-        make_id = row['Make Id']
-        year = row['Trim Year']
-        trim_id = row['Trim Id']
 
-        if make not in car_brands:
-            car_brands[make] = make_id
+# Load data from CSV
+def load_car_data(filename):
+    with open(filename, 'r') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            make = row['make']
+            model = row['model']
+            year = row['year']
 
-        car_models[make].append((model, year, trim_id))
+            car_brands.add(make)
+            car_models[make][model].add(year)
 
-# Sort car brands by make_id
-car_brands = dict(sorted(car_brands.items(), key=lambda x: int(x[1])))
+
+# Load the data when the bot starts
+load_car_data('vehicles (1).csv')
 
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
+
 
 async def get_image_url(make, model, year):
     logging.info(f"Attempting to get image URL for {make} {model} {year}")
@@ -72,61 +73,30 @@ async def get_image_url(make, model, year):
     logging.warning("No image URL found")
     return None
 
-def create_embed(title, description=None, fields=None, color=0x00ff00, image_url=None):
+
+def create_embed(title, description=None, options=None, color=0x00ff00, image_url=None, page=None, total_pages=None):
     embed = discord.Embed(title=title, description=description, color=color)
-    if fields:
-        for name, value in fields:
-            if len(value) > 1024:
-                chunks = [value[i:i + 1024] for i in range(0, len(value), 1024)]
-                for i, chunk in enumerate(chunks):
-                    embed.add_field(name=f"{name} (part {i + 1})", value=chunk, inline=False)
-            else:
-                embed.add_field(name=name, value=value, inline=False)
+
+    if options:
+        # Use larger font for options
+        options_text = "\n".join([f"**{option}**" for option in options])
+        embed.add_field(name="Options", value=options_text, inline=False)
+
     if image_url:
-        logging.info(f"Setting image URL in embed: {image_url}")
         embed.set_image(url=image_url)
+
+    if page is not None and total_pages is not None:
+        embed.set_footer(text=f"Page {page + 1} of {total_pages}")
+
     return embed
 
-@bot.command(name='hello')
-async def on_hello(ctx):
-    logging.info("Hello command received")
-    await ctx.reply('Hello fellow car guy!', mention_author=True)
 
-def paginate(options, page_size=10):
-    for i in range(0, len(options), page_size):
-        yield options[i:i + page_size]
-
-@bot.command(name='car')
-async def find_car(ctx):
-    logging.info("Car command received")
-    brands = '\n'.join([f'{make_id}. {make}' for make, make_id in car_brands.items()])
-    embed = create_embed("Car Brands", "Please choose a car brand by entering the number", [("Options", brands)])
-    await ctx.send(embed=embed)
-
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
-
-    try:
-        logging.info("Waiting for brand selection")
-        msg = await bot.wait_for('message', check=check, timeout=30)
-        selected_make_id = msg.content.strip()
-        selected_brand = next((make for make, make_id in car_brands.items() if make_id == selected_make_id), None)
-        if not selected_brand:
-            logging.warning("Invalid brand number entered")
-            await ctx.send(embed=create_embed("Error", "Invalid brand number"))
-            return
-        logging.info(f"Selected brand: {selected_brand}")
-    except asyncio.TimeoutError:
-        logging.warning("Brand selection timed out")
-        await ctx.send(embed=create_embed("Error", "You took too long to respond"))
-        return
-
-    models = car_models[selected_brand]
-    pages = list(paginate(models))
-
+async def paginate_options(ctx, title, description, all_options, options_per_page=10):
+    pages = [all_options[i:i + options_per_page] for i in range(0, len(all_options), options_per_page)]
+    total_pages = len(pages)
     current_page = 0
-    embed = create_embed("Models", f"Please choose a car model from {selected_brand} by entering the number", [
-        ("Options", '\n'.join([f'{trim_id}. {model} ({year})' for model, year, trim_id in pages[current_page]]))])
+
+    embed = create_embed(title, description, pages[current_page], page=current_page, total_pages=total_pages)
     message = await ctx.send(embed=embed)
 
     await message.add_reaction('⬅️')
@@ -135,76 +105,104 @@ async def find_car(ctx):
     def reaction_check(reaction, user):
         return user == ctx.author and str(reaction.emoji) in ['⬅️', '➡️'] and reaction.message.id == message.id
 
+    def message_check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
     while True:
-        try:
-            tasks = [
-                asyncio.create_task(bot.wait_for('message', check=check, timeout=30)),
-                asyncio.create_task(bot.wait_for('reaction_add', check=reaction_check, timeout=30))
-            ]
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        tasks = [
+            asyncio.create_task(bot.wait_for('reaction_add', check=reaction_check)),
+            asyncio.create_task(bot.wait_for('message', check=message_check))
+        ]
 
-            for task in pending:
-                task.cancel()
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=60.0)
 
-            if not done:
-                raise asyncio.TimeoutError()
+        for task in pending:
+            task.cancel()
 
-            result = done.pop().result()
+        if not done:
+            await ctx.send("You took too long to respond. Please try again.")
+            return None
 
-            if isinstance(result, discord.Message):
-                # User selected a model
-                msg = result
-                selected_trim_id = msg.content.strip()
-                try:
-                    selected_model, selected_year = next(
-                        (model, year) for model, year, trim_id in models if trim_id == selected_trim_id)
-                    logging.info(f"Selected model: {selected_model}, year: {selected_year}")
-                    break
-                except StopIteration:
-                    logging.warning("Invalid model number entered")
-                    await ctx.send(embed=create_embed("Error", "Invalid model number"))
-                    continue
-            else:
-                # User navigated pages
-                reaction, user = result
-                if str(reaction.emoji) == '➡️':
-                    current_page = min(current_page + 1, len(pages) - 1)
-                elif str(reaction.emoji) == '⬅️':
-                    current_page = max(current_page - 1, 0)
+        result = done.pop().result()
 
-                embed = create_embed("Models",
-                                     f"Please choose a car model from {selected_brand} by entering the number",
-                                     [("Options", '\n'.join(
-                                         [f'{trim_id}. {model} ({year})' for model, year, trim_id in
-                                          pages[current_page]]))])
-                await message.edit(embed=embed)
-                await message.remove_reaction(reaction, user)
+        if isinstance(result, tuple):  # Reaction result
+            reaction, user = result
+            if str(reaction.emoji) == '➡️' and current_page < total_pages - 1:
+                current_page += 1
+            elif str(reaction.emoji) == '⬅️' and current_page > 0:
+                current_page -= 1
 
-        except asyncio.TimeoutError:
-            logging.info("Model selection/navigation timed out")
-            await ctx.send(embed=create_embed("Error", "You took too long to respond"))
-            return
+            embed = create_embed(title, description, pages[current_page], page=current_page, total_pages=total_pages)
+            await message.edit(embed=embed)
+            await message.remove_reaction(reaction, user)
+        else:  # Message result
+            return result.content
 
-    logging.info(f"Attempting to get image URL for {selected_brand} {selected_model} {selected_year}")
-    image_url = await get_image_url(selected_brand, selected_model, selected_year)
-    if not image_url:
-        logging.warning("No image URL found, sending error embed")
-        await ctx.send(embed=create_embed("Error", "No image found for the selected car"))
+    return None
+
+
+@bot.command(name='car')
+async def find_car(ctx):
+    logging.info("Car command received")
+
+    # Show brands
+    brands = sorted(list(car_brands))
+    selected_brand = await paginate_options(ctx, "Car Brands", "Please choose a car brand by entering its name", brands)
+
+    if not selected_brand:
         return
 
-    logging.info(f"Creating embed with image URL: {image_url}")
-    embed = create_embed("Selected Car", description=f"{selected_brand} {selected_model} {selected_year}",
-                         image_url=image_url)
-    logging.debug(f"Embed image URL: {embed.image.url if embed.image else 'No image set'}")
-    await ctx.send(embed=embed)
+    selected_brand = selected_brand.strip().title()
+    if selected_brand not in car_brands:
+        await ctx.send("Invalid brand name. Please try again.")
+        return
+    logging.info(f"Selected brand: {selected_brand}")
 
-@bot.event
-async def on_command_error(ctx, error):
-    logging.error(f"An error occurred: {str(error)}")
-    await ctx.send(f"An error occurred: {str(error)}")
+    # Show models for the selected brand
+    models = car_models[selected_brand]
+    if not models:
+        await ctx.send(f"No models found for {selected_brand}. Please try another brand.")
+        return
+
+    model_options = [f"{model} ({', '.join(sorted(years, reverse=True))})" for model, years in models.items()]
+    selected_model = await paginate_options(ctx, f"{selected_brand} Models",
+                                            "Please choose a car model by entering its name", model_options)
+
+    if not selected_model:
+        return
+
+    selected_model = selected_model.strip().title()
+    if selected_model not in models:
+        await ctx.send("Invalid model name. Please try again.")
+        return
+    logging.info(f"Selected model: {selected_model}")
+
+    # Show years for the selected model and ask user to choose
+    years = sorted(models[selected_model], reverse=True)
+    selected_year = await paginate_options(ctx, f"{selected_brand} {selected_model} Years",
+                                           "Please choose a year by entering it", years)
+
+    if not selected_year:
+        return
+
+    if selected_year not in years:
+        await ctx.send("Invalid year. Please try again.")
+        return
+    logging.info(f"Selected year: {selected_year}")
+
+    # Fetch and display the image
+    image_url = await get_image_url(selected_brand, selected_model, selected_year)
+    if image_url:
+        embed = create_embed(f"{selected_brand} {selected_model} {selected_year}",
+                             image_url=image_url)
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("Sorry, I couldn't find an image for that car.")
+
 
 @bot.event
 async def on_ready():
     logging.info(f"Bot is ready. Logged in as {bot.user.name}")
 
-bot.run(MY_TOKEN)
+
+bot.run(YOUR_TOKEN)
