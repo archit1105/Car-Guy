@@ -6,6 +6,7 @@ from discord.ext import commands
 import aiohttp
 import urllib
 import logging
+import os
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -203,6 +204,10 @@ async def find_car(ctx):
 @bot.event
 async def on_ready():
     logging.info(f"Bot is ready. Logged in as {bot.user.name}")
+
+@bot.command(name='hello')
+async def hello(ctx):
+    await ctx.reply('Hello fellow car guy!')
 
 
 bot.run(YOUR_TOKEN)
